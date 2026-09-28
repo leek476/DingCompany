@@ -1,468 +1,776 @@
 'use strict';
 
-const express = require('express');
-const multer = require('multer');
-const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
-const store = require('./store');
+const http = require('node:http');
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const fsp = require('node:fs/promises');
+const path = require('node:path');
+const { promisify } = require('node:util');
 
-const app = express();
-const PORT = process.env.PORT || 3000;
-const IS_PROD = process.env.NODE_ENV === 'production';
-
-const SESSION_SECRET = process.env.SESSION_SECRET || (IS_PROD ? '' : 'dev-only-secret-change-me');
-if (!SESSION_SECRET) {
-  console.error('SESSION_SECRET must be set in production.');
-  process.exit(1);
-}
-
-const COOKIE_NAME = 'iw_session';
-const SESSION_MS = 7 * 24 * 60 * 60 * 1000;
+const scrypt = promisify(crypto.scrypt);
+const PORT = Number(process.env.PORT || 3000);
+const ROOT = __dirname;
+const DATA_DIR = path.join(ROOT, 'data');
+const UPLOAD_DIR = path.join(ROOT, 'uploads');
+const DATABASE_FILE = path.join(DATA_DIR, 'database.json');
+const SESSION_TTL_MS = 1000 * 60 * 60 * 12;
+const MAX_JSON_BYTES = 1_000_000;
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+const EVENT_HEARTBEAT_MS = 25_000;
+const sessions = new Map();
+const eventClients = new Set();
 
-store.seedAdmin();
+let database;
 
-app.disable('x-powered-by');
-app.set('trust proxy', 1); // Render terminates HTTPS in front of the app
+const defaultProject = {
+  id: 'intercoastal-integrated-utility',
+  name: 'Intercoastal Integrated Utility Program',
+  sector: 'Integrated Power, Water Supply & Sewage Treatment',
+  location: 'Coastal Service District',
+  totalProjectValue: 12800000,
+  estimatedProjectCost: 8420000,
+  projectProgress: 68,
+  status: 'Construction in progress',
+  startDate: '2026-06-15',
+  projectedCompletion: '2026-12-20',
+  duration: '18 months',
+  description: 'A resilient utility program that combines dependable power generation, treated water supply and modern sewage treatment for growing coastal communities.',
+  capacity: '18 MW power · 9 MGD water · 6 MGD treatment',
+  stages: [
+    { name: 'Site & permits', status: 'complete', date: 'Jun 2026' },
+    { name: 'Detailed engineering', status: 'complete', date: 'Jul 2026' },
+    { name: 'Equipment procurement', status: 'complete', date: 'Aug 2026' },
+    { name: 'Civil construction', status: 'current', date: 'Sep 2026' },
+    { name: 'Commissioning', status: 'upcoming', date: 'Dec 2026' }
+  ],
+  updates: [
+    {
+      id: 'update-3',
+      date: '2026-09-16',
+      title: 'Civil works milestone reached',
+      body: 'Foundation and intake-structure works have reached their planned September milestone.'
+    },
+    {
+      id: 'update-2',
+      date: '2026-09-03',
+      title: 'Treatment equipment secured',
+      body: 'Primary treatment and pumping equipment has cleared factory acceptance testing.'
+    },
+    {
+      id: 'update-1',
+      date: '2026-08-19',
+      title: 'Grid interconnection approved',
+      body: 'The interconnection design received its technical approval, keeping the power workstream on schedule.'
+    }
+  ]
+};
 
-/* ---------- security headers (matches the strict CSP the frontend is built for) ---------- */
-
-app.use((req, res, next) => {
-  res.setHeader('Content-Security-Policy', [
-    "default-src 'self'",
-    "script-src 'self'",
-    "style-src 'self'",
-    "img-src 'self' data:",
-    "font-src 'self'",
-    "connect-src 'self'",
-    "object-src 'none'",
-    "base-uri 'self'",
-    "form-action 'self'",
-    "frame-ancestors 'none'"
-  ].join('; '));
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('Referrer-Policy', 'same-origin');
-  res.setHeader('X-Frame-Options', 'DENY');
-  if (IS_PROD) res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
-  next();
-});
-
-app.use(express.json({ limit: '100kb' }));
-
-/* ---------- sessions: signed, HttpOnly cookie ---------- */
-
-function sign(value) {
-  return crypto.createHmac('sha256', SESSION_SECRET).update(value).digest('base64url');
+function clone(value) {
+  return JSON.parse(JSON.stringify(value));
 }
 
-function createToken(userId) {
-  const payload = Buffer.from(JSON.stringify({ uid: userId, exp: Date.now() + SESSION_MS })).toString('base64url');
-  return `${payload}.${sign(payload)}`;
+function defaultDatabase() {
+  return { users: [], project: clone(defaultProject), documents: [], messages: [] };
 }
 
-function readToken(token) {
-  if (!token || !token.includes('.')) return null;
-  const [payload, signature] = token.split('.');
-  const expected = sign(payload);
-  const a = Buffer.from(signature);
-  const b = Buffer.from(expected);
-  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+async function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const derived = await scrypt(password, salt, 64);
+  return `${salt}:${derived.toString('hex')}`;
+}
+
+async function passwordMatches(password, stored) {
+  const [salt, key] = String(stored || '').split(':');
+  if (!salt || !key) return false;
+  const derived = await scrypt(password, salt, 64);
+  const expected = Buffer.from(key, 'hex');
+  return expected.length === derived.length && crypto.timingSafeEqual(expected, derived);
+}
+
+function normalizeEmail(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function validEmail(value) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+}
+
+function cleanText(value, maxLength = 180) {
+  return String(value || '').replace(/[<>]/g, '').trim().slice(0, maxLength);
+}
+
+function publicUser(user) {
+  return {
+    id: user.id,
+    email: user.email,
+    role: user.role,
+    investment: Number(user.investment || 0),
+    createdAt: user.createdAt,
+    profile: {
+      name: user.profile?.name || '',
+      company: user.profile?.company || '',
+      phone: user.profile?.phone || '',
+      location: user.profile?.location || ''
+    }
+  };
+}
+
+async function initializeDatabase() {
+  await fsp.mkdir(DATA_DIR, { recursive: true });
+  await fsp.mkdir(UPLOAD_DIR, { recursive: true });
+
   try {
-    const data = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
-    return data.exp > Date.now() ? data.uid : null;
-  } catch {
-    return null;
+    database = JSON.parse(await fsp.readFile(DATABASE_FILE, 'utf8'));
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    database = defaultDatabase();
   }
+
+  database.users ||= [];
+  database.documents ||= [];
+  database.messages ||= [];
+  database.project ||= clone(defaultProject);
+  database.project.stages ||= clone(defaultProject.stages);
+  database.project.updates ||= clone(defaultProject.updates);
+
+  const bootstrapEmail = normalizeEmail(process.env.ADMIN_EMAIL || 'admin@intercoastalwater.com');
+  if (!database.users.some((user) => user.email === bootstrapEmail)) {
+    const bootstrapPassword = process.env.ADMIN_PASSWORD || 'ChangeMe!2026';
+    database.users.push({
+      id: crypto.randomUUID(),
+      email: bootstrapEmail,
+      passwordHash: await hashPassword(bootstrapPassword),
+      role: 'admin',
+      investment: 0,
+      createdAt: new Date().toISOString(),
+      profile: {
+        name: cleanText(process.env.ADMIN_NAME || 'Intercoastal Administrator', 80),
+        company: 'Intercoastal Water LLC',
+        phone: '',
+        location: 'Coastal Service District'
+      }
+    });
+  }
+  saveDatabase();
+}
+
+function saveDatabase() {
+  const temporaryFile = `${DATABASE_FILE}.${process.pid}.tmp`;
+  fs.writeFileSync(temporaryFile, JSON.stringify(database, null, 2), 'utf8');
+  fs.renameSync(temporaryFile, DATABASE_FILE);
+}
+
+function sendJson(response, statusCode, payload, extraHeaders = {}) {
+  response.writeHead(statusCode, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store',
+    ...extraHeaders
+  });
+  response.end(JSON.stringify(payload));
+}
+
+function sendError(response, statusCode, error) {
+  sendJson(response, statusCode, { error });
 }
 
 function parseCookies(header = '') {
-  const cookies = {};
-  header.split(';').forEach((part) => {
-    const index = part.indexOf('=');
-    if (index < 0) return;
-    cookies[part.slice(0, index).trim()] = decodeURIComponent(part.slice(index + 1).trim());
-  });
-  return cookies;
+  return header.split(';').reduce((cookies, part) => {
+    const divider = part.indexOf('=');
+    if (divider === -1) return cookies;
+    const key = part.slice(0, divider).trim();
+    const value = part.slice(divider + 1).trim();
+    cookies[key] = value;
+    return cookies;
+  }, {});
 }
 
-function setSessionCookie(res, userId) {
-  const flags = ['HttpOnly', 'SameSite=Lax', 'Path=/', `Max-Age=${Math.floor(SESSION_MS / 1000)}`];
-  if (IS_PROD) flags.push('Secure');
-  res.setHeader('Set-Cookie', `${COOKIE_NAME}=${encodeURIComponent(createToken(userId))}; ${flags.join('; ')}`);
+function createSession(userId) {
+  const token = crypto.randomBytes(32).toString('base64url');
+  sessions.set(token, { userId, expiresAt: Date.now() + SESSION_TTL_MS });
+  return token;
 }
 
-function clearSessionCookie(res) {
-  const flags = ['HttpOnly', 'SameSite=Lax', 'Path=/', 'Max-Age=0'];
-  if (IS_PROD) flags.push('Secure');
-  res.setHeader('Set-Cookie', `${COOKIE_NAME}=; ${flags.join('; ')}`);
+function sessionCookie(token, maxAge = Math.floor(SESSION_TTL_MS / 1000)) {
+  const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
+  return `intercoastal_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAge}${secure}`;
 }
 
-app.use((req, res, next) => {
-  const userId = readToken(parseCookies(req.headers.cookie)[COOKIE_NAME]);
-  req.user = userId ? store.findUserById(userId) : null;
-  next();
-});
-
-/* Reject cross-site state-changing requests. */
-app.use('/api', (req, res, next) => {
-  if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
-  const origin = req.headers.origin;
-  if (origin) {
-    try {
-      if (new URL(origin).host !== req.headers.host) return res.status(403).json({ error: 'Cross-site request blocked.' });
-    } catch {
-      return res.status(403).json({ error: 'Cross-site request blocked.' });
-    }
+function getCurrentUser(request) {
+  const token = parseCookies(request.headers.cookie).intercoastal_session;
+  const session = token && sessions.get(token);
+  if (!session) return null;
+  if (session.expiresAt < Date.now()) {
+    sessions.delete(token);
+    return null;
   }
-  next();
-});
-
-function requireAuth(req, res, next) {
-  if (!req.user) return res.status(401).json({ error: 'Please sign in.' });
-  next();
+  const user = database.users.find((candidate) => candidate.id === session.userId);
+  return user || null;
 }
 
-function requireAdmin(req, res, next) {
-  if (!req.user) return res.status(401).json({ error: 'Please sign in.' });
-  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Administrator access required.' });
-  next();
-}
-
-/* ---------- helpers ---------- */
-
-const { db } = store;
-
-function text(value, max) {
-  return String(value ?? '').trim().slice(0, max);
-}
-
-function finiteNumber(value) {
-  const n = Number(value);
-  return Number.isFinite(n) ? n : null;
-}
-
-function canSeeDocument(user, doc) {
-  return user.role === 'admin' || doc.audience === 'all' || doc.audience === user.id;
-}
-
-function publicDocument(doc) {
-  return {
-    id: doc.id,
-    title: doc.title,
-    description: doc.description,
-    originalName: doc.originalName,
-    audience: doc.audience,
-    createdAt: doc.createdAt
-  };
-}
-
-function visibleDocuments(user) {
-  return db.documents
-    .filter((doc) => canSeeDocument(user, doc))
-    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-    .map(publicDocument);
-}
-
-function projectView() {
-  const p = db.project;
-  return { ...p, stages: p.stages.map((s) => ({ ...s })), updates: p.updates.map((u) => ({ ...u })) };
-}
-
-/* ---------- health check (used by Render) ---------- */
-
-app.get('/healthz', (req, res) => res.type('text').send('ok'));
-
-/* ---------- auth ---------- */
-
-const loginAttempts = new Map();
-
-function loginLimited(ip) {
-  const now = Date.now();
-  const entry = loginAttempts.get(ip);
-  if (!entry || entry.reset < now) {
-    loginAttempts.set(ip, { count: 1, reset: now + 15 * 60 * 1000 });
-    return false;
+function requireUser(request, response) {
+  const user = getCurrentUser(request);
+  if (!user) {
+    sendError(response, 401, 'Please sign in to continue.');
+    return null;
   }
-  entry.count += 1;
-  return entry.count > 10;
+  return user;
 }
 
-app.post('/api/auth/login', (req, res) => {
-  if (loginLimited(req.ip)) return res.status(429).json({ error: 'Too many attempts. Try again in a few minutes.' });
-  const email = text(req.body?.email, 200);
-  const password = String(req.body?.password ?? '');
-  const user = store.findUserByEmail(email);
-  const ok = user ? store.verifyPassword(password, user.passwordHash) : (store.verifyPassword(password, 'scrypt$00$00'), false);
-  if (!ok) return res.status(401).json({ error: 'Incorrect email or password.' });
-  setSessionCookie(res, user.id);
-  res.json({ user: store.publicUser(user) });
-});
-
-app.post('/api/auth/logout', (req, res) => {
-  clearSessionCookie(res);
-  res.json({ ok: true });
-});
-
-app.get('/api/auth/me', requireAuth, (req, res) => {
-  res.json({ user: store.publicUser(req.user) });
-});
-
-/* ---------- dashboard ---------- */
-
-app.get('/api/dashboard', requireAuth, (req, res) => {
-  const project = projectView();
-  const investment = req.user.role === 'admin' ? 0 : Number(req.user.investment) || 0;
-  const share = project.totalProjectValue > 0 ? (investment / project.totalProjectValue) * 100 : 0;
-  const margin = Math.max(0, project.totalProjectValue - project.estimatedProjectCost);
-  res.json({
-    user: store.publicUser(req.user),
-    project,
-    overview: {
-      yourInvestment: investment,
-      investmentShare: Number(share.toFixed(2)),
-      expectedProjectMargin: margin
-    },
-    recentDocuments: visibleDocuments(req.user).slice(0, 3)
-  });
-});
-
-/* ---------- profile ---------- */
-
-app.patch('/api/profile', requireAuth, (req, res) => {
-  const name = text(req.body?.name, 80);
-  if (!name) return res.status(400).json({ error: 'Please enter your full name.' });
-  req.user.profile = {
-    name,
-    company: text(req.body?.company, 100),
-    phone: text(req.body?.phone, 40),
-    location: text(req.body?.location, 100)
-  };
-  store.save();
-  res.json({ user: store.publicUser(req.user) });
-});
-
-/* ---------- documents ---------- */
-
-app.get('/api/documents', requireAuth, (req, res) => {
-  res.json({ documents: visibleDocuments(req.user) });
-});
-
-app.get('/api/documents/:id/download', requireAuth, (req, res) => {
-  const doc = db.documents.find((d) => d.id === req.params.id);
-  if (!doc || !canSeeDocument(req.user, doc)) return res.status(404).json({ error: 'Document not found.' });
-  const filePath = path.join(store.UPLOAD_DIR, doc.storedName);
-  if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'File is no longer available.' });
-  const safeName = `${doc.title.replace(/[^\w\- ]+/g, '').trim() || 'document'}.pdf`;
-  res.setHeader('Cache-Control', 'private, no-store');
-  res.download(filePath, safeName);
-});
-
-/* ---------- messages ---------- */
-
-app.get('/api/messages', requireAuth, (req, res) => {
-  const me = req.user;
-  const messages = db.messages
-    .filter((m) => me.role === 'admin' || m.senderId === me.id || m.recipientId === me.id || m.recipientId === 'all')
-    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-    .map((m) => ({ id: m.id, subject: m.subject, message: m.message, senderName: m.senderName, createdAt: m.createdAt }));
-  res.json({ messages });
-});
-
-app.post('/api/messages', requireAuth, (req, res) => {
-  const subject = text(req.body?.subject, 120);
-  const message = text(req.body?.message, 2000);
-  if (!subject || !message) return res.status(400).json({ error: 'Please add a subject and a message.' });
-
-  let recipientId = 'admin';
-  if (req.user.role === 'admin') {
-    recipientId = text(req.body?.recipientId, 80) || 'all';
-    if (recipientId !== 'all' && !store.findUserById(recipientId)) {
-      return res.status(400).json({ error: 'That recipient no longer exists.' });
-    }
+function requireAdmin(request, response) {
+  const user = requireUser(request, response);
+  if (!user) return null;
+  if (user.role !== 'admin') {
+    sendError(response, 403, 'Administrator access is required.');
+    return null;
   }
-
-  db.messages.push({
-    id: store.newId(),
-    subject,
-    message,
-    senderId: req.user.id,
-    senderName: req.user.profile.name || req.user.email,
-    recipientId,
-    createdAt: new Date().toISOString()
-  });
-  store.save();
-  res.status(201).json({ ok: true });
-});
-
-/* ---------- administration ---------- */
-
-app.get('/api/admin/summary', requireAdmin, (req, res) => {
-  res.json({
-    users: db.users.map((u) => ({
-      id: u.id,
-      name: u.profile.name || u.email,
-      email: u.email,
-      role: u.role,
-      investment: u.investment || 0
-    })),
-    documentCount: db.documents.length,
-    messageCount: db.messages.length
-  });
-});
-
-app.patch('/api/admin/project', requireAdmin, (req, res) => {
-  const body = req.body || {};
-  const p = db.project;
-
-  if (Array.isArray(body.stages)) {
-    if (body.stages.length > 30) return res.status(400).json({ error: 'Too many milestones.' });
-    const allowed = ['complete', 'current', 'upcoming'];
-    p.stages = body.stages
-      .map((s) => ({
-        name: text(s?.name, 80),
-        status: allowed.includes(s?.status) ? s.status : 'upcoming',
-        date: text(s?.date, 40)
-      }))
-      .filter((s) => s.name);
-  }
-
-  for (const field of ['totalProjectValue', 'estimatedProjectCost', 'projectProgress']) {
-    if (body[field] === undefined) continue;
-    const n = finiteNumber(body[field]);
-    const max = field === 'projectProgress' ? 100 : 1e12;
-    if (n === null || n < 0 || n > max) return res.status(400).json({ error: 'One of the figures is not valid.' });
-    p[field] = n;
-  }
-
-  if (body.status !== undefined) p.status = text(body.status, 80) || p.status;
-  if (body.location !== undefined) p.location = text(body.location, 120);
-  if (body.capacity !== undefined) p.capacity = text(body.capacity, 120);
-
-  store.save();
-  res.json({ project: projectView() });
-});
-
-app.patch('/api/admin/users/:id/investment', requireAdmin, (req, res) => {
-  const user = store.findUserById(req.params.id);
-  if (!user) return res.status(404).json({ error: 'Client not found.' });
-  const amount = finiteNumber(req.body?.investment);
-  if (amount === null || amount < 0 || amount > 1e12) return res.status(400).json({ error: 'Enter a valid investment amount.' });
-  user.investment = amount;
-  store.save();
-  res.json({ ok: true });
-});
-
-app.post('/api/admin/users', requireAdmin, (req, res) => {
-  const name = text(req.body?.name, 80);
-  const email = text(req.body?.email, 200).toLowerCase();
-  const password = String(req.body?.password ?? '');
-  const role = req.body?.role === 'admin' ? 'admin' : 'user';
-
-  if (!name) return res.status(400).json({ error: 'Please enter a full name.' });
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Enter a valid email address.' });
-  if (password.length < 8) return res.status(400).json({ error: 'The password must be at least 8 characters.' });
-  if (store.findUserByEmail(email)) return res.status(409).json({ error: 'An account with that email already exists.' });
-
-  const user = store.createUser({ name, email, password, role });
-  res.status(201).json({ user: store.publicUser(user) });
-});
-
-/* PDF uploads */
-
-const upload = multer({
-  storage: multer.diskStorage({
-    destination: store.UPLOAD_DIR,
-    filename: (req, file, cb) => cb(null, `${crypto.randomUUID()}.pdf`)
-  }),
-  limits: { fileSize: MAX_UPLOAD_BYTES, files: 1 }
-});
-
-function isPdfFile(filePath) {
-  const fd = fs.openSync(filePath, 'r');
-  try {
-    const buffer = Buffer.alloc(5);
-    fs.readSync(fd, buffer, 0, 5, 0);
-    return buffer.toString('latin1') === '%PDF-';
-  } finally {
-    fs.closeSync(fd);
-  }
+  return user;
 }
 
-function removeFile(filePath) {
-  fs.unlink(filePath, () => {});
-}
-
-app.get('/api/admin/documents', requireAdmin, (req, res) => {
-  const documents = [...db.documents].sort((a, b) => b.createdAt.localeCompare(a.createdAt)).map(publicDocument);
-  res.json({ documents });
-});
-
-app.post('/api/admin/documents', requireAdmin, (req, res) => {
-  upload.single('file')(req, res, (uploadError) => {
-    if (uploadError) {
-      const tooBig = uploadError.code === 'LIMIT_FILE_SIZE';
-      return res.status(400).json({ error: tooBig ? 'That file is larger than 10 MB.' : 'The upload failed. Please try again.' });
-    }
-    const file = req.file;
-    if (!file) return res.status(400).json({ error: 'Choose a PDF to upload.' });
-
-    const title = text(req.body?.title, 140);
-    const description = text(req.body?.description, 300);
-    const audience = text(req.body?.audience, 80) || 'all';
-
-    if (!title) { removeFile(file.path); return res.status(400).json({ error: 'Please add a document title.' }); }
-    if (audience !== 'all' && !store.findUserById(audience)) {
-      removeFile(file.path);
-      return res.status(400).json({ error: 'That recipient no longer exists.' });
-    }
-    if (!isPdfFile(file.path)) {
-      removeFile(file.path);
-      return res.status(400).json({ error: 'That file is not a valid PDF.' });
-    }
-
-    db.documents.push({
-      id: store.newId(),
-      title,
-      description,
-      audience,
-      originalName: text(file.originalname, 200),
-      storedName: file.filename,
-      createdAt: new Date().toISOString()
+function readRequestBody(request, maxBytes) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let totalBytes = 0;
+    request.on('data', (chunk) => {
+      totalBytes += chunk.length;
+      if (totalBytes > maxBytes) {
+        const error = new Error('Request is too large.');
+        error.statusCode = 413;
+        reject(error);
+        request.destroy();
+        return;
+      }
+      chunks.push(chunk);
     });
-    store.save();
-    res.status(201).json({ ok: true });
+    request.on('end', () => resolve(Buffer.concat(chunks)));
+    request.on('error', reject);
   });
+}
+
+async function readJson(request) {
+  const buffer = await readRequestBody(request, MAX_JSON_BYTES);
+  if (!buffer.length) return {};
+  try {
+    return JSON.parse(buffer.toString('utf8'));
+  } catch {
+    const error = new Error('The request body must be valid JSON.');
+    error.statusCode = 400;
+    throw error;
+  }
+}
+
+function parseMultipart(buffer, contentType) {
+  const boundaryMatch = /boundary=(?:"([^"]+)"|([^;\s]+))/i.exec(contentType || '');
+  if (!boundaryMatch) {
+    const error = new Error('A multipart boundary is required.');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const boundary = boundaryMatch[1] || boundaryMatch[2];
+  const pieces = buffer.toString('latin1').split(`--${boundary}`);
+  const fields = {};
+  const files = {};
+
+  for (let piece of pieces.slice(1, -1)) {
+    if (piece.startsWith('\r\n')) piece = piece.slice(2);
+    if (piece.endsWith('\r\n')) piece = piece.slice(0, -2);
+    const headerEnd = piece.indexOf('\r\n\r\n');
+    if (headerEnd === -1) continue;
+    const rawHeaders = piece.slice(0, headerEnd);
+    const body = piece.slice(headerEnd + 4);
+    const disposition = /content-disposition:\s*form-data;\s*name="([^"]+)"(?:;\s*filename="([^"]*)")?/i.exec(rawHeaders);
+    if (!disposition) continue;
+    const [, fieldName, fileName] = disposition;
+    const contentTypeMatch = /content-type:\s*([^\r\n]+)/i.exec(rawHeaders);
+    if (typeof fileName === 'string') {
+      files[fieldName] = {
+        filename: fileName,
+        contentType: contentTypeMatch ? contentTypeMatch[1].trim().toLowerCase() : 'application/octet-stream',
+        data: Buffer.from(body, 'latin1')
+      };
+    } else {
+      fields[fieldName] = Buffer.from(body, 'latin1').toString('utf8');
+    }
+  }
+  return { fields, files };
+}
+
+function overviewFor(user) {
+  const project = database.project;
+  const yourInvestment = Number(user.investment || 0);
+  return {
+    yourInvestment,
+    totalProjectValue: Number(project.totalProjectValue || 0),
+    estimatedProjectCost: Number(project.estimatedProjectCost || 0),
+    projectProgress: Number(project.projectProgress || 0),
+    investmentShare: project.totalProjectValue ? (yourInvestment / project.totalProjectValue) * 100 : 0,
+    expectedProjectMargin: project.totalProjectValue - project.estimatedProjectCost
+  };
+}
+
+function canAccessDocument(document, user) {
+  return user.role === 'admin' || document.audience === 'all' || document.audience === user.id;
+}
+
+function visibleDocument(document) {
+  return {
+    id: document.id,
+    title: document.title,
+    description: document.description,
+    originalName: document.originalName,
+    createdAt: document.createdAt,
+    audience: document.audience
+  };
+}
+
+function userSummary(user) {
+  return {
+    id: user.id,
+    name: user.profile?.name || user.email,
+    email: user.email,
+    company: user.profile?.company || '',
+    investment: Number(user.investment || 0),
+    role: user.role
+  };
+}
+
+function apiHeaders(response) {
+  response.setHeader('X-Content-Type-Options', 'nosniff');
+  response.setHeader('X-Frame-Options', 'DENY');
+  response.setHeader('Referrer-Policy', 'same-origin');
+}
+
+function writeEvent(response, event, payload) {
+  response.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
+}
+
+function removeEventClient(client) {
+  eventClients.delete(client);
+}
+
+function broadcastPortalChange(type, canReceive = () => true) {
+  const payload = { type, at: new Date().toISOString() };
+  for (const client of eventClients) {
+    if (!canReceive(client)) continue;
+    if (client.response.destroyed || client.response.writableEnded) {
+      removeEventClient(client);
+      continue;
+    }
+    try {
+      writeEvent(client.response, 'portal-change', payload);
+    } catch {
+      removeEventClient(client);
+    }
+  }
+}
+
+function canReceiveDocumentChange(client, document) {
+  return client.role === 'admin' || document.audience === 'all' || document.audience === client.userId;
+}
+
+function canReceiveMessageChange(client, message) {
+  return client.role === 'admin'
+    || message.senderId === client.userId
+    || message.recipientId === 'all'
+    || message.recipientId === client.userId;
+}
+
+function openEventStream(request, response) {
+  const user = getCurrentUser(request);
+  if (!user) {
+    sendError(response, 401, 'Please sign in to continue.');
+    return;
+  }
+
+  response.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
+  response.flushHeaders?.();
+
+  const client = { response, userId: user.id, role: user.role };
+  const removeClient = () => removeEventClient(client);
+  eventClients.add(client);
+  response.on('close', removeClient);
+  response.on('error', removeClient);
+
+  try {
+    response.write('retry: 3000\n\n');
+    writeEvent(response, 'connected', { at: new Date().toISOString() });
+  } catch {
+    removeClient();
+  }
+}
+
+const eventHeartbeat = setInterval(() => {
+  for (const client of eventClients) {
+    if (client.response.destroyed || client.response.writableEnded) {
+      removeEventClient(client);
+      continue;
+    }
+    try {
+      client.response.write(': keep-alive\n\n');
+    } catch {
+      removeEventClient(client);
+    }
+  }
+}, EVENT_HEARTBEAT_MS);
+eventHeartbeat.unref();
+
+async function handleApi(request, response, pathname) {
+  apiHeaders(response);
+
+  if (request.method === 'POST' && pathname === '/api/auth/register') {
+    const body = await readJson(request);
+    const name = cleanText(body.name, 80);
+    const email = normalizeEmail(body.email);
+    const password = String(body.password || '');
+    if (name.length < 2) return sendError(response, 400, 'Enter your full name.');
+    if (!validEmail(email)) return sendError(response, 400, 'Enter a valid email address.');
+    if (password.length < 8) return sendError(response, 400, 'Use a password with at least 8 characters.');
+    if (database.users.some((user) => user.email === email)) {
+      return sendError(response, 409, 'An account with that email already exists.');
+    }
+    const user = {
+      id: crypto.randomUUID(),
+      email,
+      passwordHash: await hashPassword(password),
+      role: 'user',
+      investment: 0,
+      createdAt: new Date().toISOString(),
+      profile: { name, company: '', phone: '', location: '' }
+    };
+    database.users.push(user);
+    saveDatabase();
+    broadcastPortalChange('admin', (client) => client.role === 'admin');
+    const token = createSession(user.id);
+    return sendJson(response, 201, { user: publicUser(user) }, { 'Set-Cookie': sessionCookie(token) });
+  }
+
+  if (request.method === 'POST' && pathname === '/api/auth/login') {
+    const body = await readJson(request);
+    const email = normalizeEmail(body.email);
+    const password = String(body.password || '');
+    const user = database.users.find((candidate) => candidate.email === email);
+    if (!user || !(await passwordMatches(password, user.passwordHash))) {
+      return sendError(response, 401, 'Invalid email or password.');
+    }
+    const token = createSession(user.id);
+    return sendJson(response, 200, { user: publicUser(user) }, { 'Set-Cookie': sessionCookie(token) });
+  }
+
+  if (request.method === 'POST' && pathname === '/api/auth/logout') {
+    const token = parseCookies(request.headers.cookie).intercoastal_session;
+    if (token) sessions.delete(token);
+    return sendJson(response, 200, { ok: true }, { 'Set-Cookie': sessionCookie('', 0) });
+  }
+
+  if (request.method === 'GET' && pathname === '/api/auth/me') {
+    const user = requireUser(request, response);
+    if (!user) return;
+    return sendJson(response, 200, { user: publicUser(user) });
+  }
+
+  if (request.method === 'GET' && pathname === '/api/events') {
+    return openEventStream(request, response);
+  }
+
+  if (request.method === 'GET' && pathname === '/api/dashboard') {
+    const user = requireUser(request, response);
+    if (!user) return;
+    const documents = database.documents.filter((document) => canAccessDocument(document, user));
+    return sendJson(response, 200, {
+      user: publicUser(user),
+      project: database.project,
+      overview: overviewFor(user),
+      recentDocuments: documents.slice(0, 3).map(visibleDocument),
+      unreadMessages: database.messages.filter((message) => user.role === 'admin' || message.senderId === user.id).length
+    });
+  }
+
+  if (request.method === 'GET' && pathname === '/api/documents') {
+    const user = requireUser(request, response);
+    if (!user) return;
+    return sendJson(response, 200, {
+      documents: database.documents.filter((document) => canAccessDocument(document, user)).map(visibleDocument)
+    });
+  }
+
+  const documentMatch = /^\/api\/documents\/([a-zA-Z0-9-]+)\/download$/.exec(pathname);
+  if (request.method === 'GET' && documentMatch) {
+    const user = requireUser(request, response);
+    if (!user) return;
+    const document = database.documents.find((item) => item.id === documentMatch[1]);
+    if (!document || !canAccessDocument(document, user)) return sendError(response, 404, 'Document not found.');
+    const documentPath = path.join(UPLOAD_DIR, document.storageName);
+    try {
+      await fsp.access(documentPath);
+    } catch {
+      return sendError(response, 404, 'The uploaded file is no longer available.');
+    }
+    response.writeHead(200, {
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(document.originalName)}`,
+      'Cache-Control': 'private, no-store',
+      'X-Content-Type-Options': 'nosniff'
+    });
+    return fs.createReadStream(documentPath).pipe(response);
+  }
+
+  if (request.method === 'PATCH' && pathname === '/api/profile') {
+    const user = requireUser(request, response);
+    if (!user) return;
+    const body = await readJson(request);
+    const name = cleanText(body.name, 80);
+    if (name.length < 2) return sendError(response, 400, 'Enter a name with at least 2 characters.');
+    user.profile = {
+      name,
+      company: cleanText(body.company, 100),
+      phone: cleanText(body.phone, 40),
+      location: cleanText(body.location, 100)
+    };
+    saveDatabase();
+    broadcastPortalChange('profile', (client) => client.userId === user.id || client.role === 'admin');
+    return sendJson(response, 200, { user: publicUser(user) });
+  }
+
+  if (request.method === 'GET' && pathname === '/api/messages') {
+    const user = requireUser(request, response);
+    if (!user) return;
+    const messages = user.role === 'admin'
+      ? database.messages
+      : database.messages.filter((message) => message.senderId === user.id || message.recipientId === user.id || message.recipientId === 'all');
+    return sendJson(response, 200, { messages: messages.slice(0, 50) });
+  }
+
+  if (request.method === 'POST' && pathname === '/api/messages') {
+    const user = requireUser(request, response);
+    if (!user) return;
+    const body = await readJson(request);
+    const subject = cleanText(body.subject, 120);
+    const message = cleanText(body.message, 2000);
+    if (!subject || !message) return sendError(response, 400, 'Add a subject and message.');
+    const messageRecord = {
+      id: crypto.randomUUID(),
+      senderId: user.id,
+      senderName: user.profile?.name || user.email,
+      recipientId: user.role === 'admin' ? (body.recipientId || 'all') : 'admin',
+      subject,
+      message,
+      createdAt: new Date().toISOString()
+    };
+    database.messages.unshift(messageRecord);
+    saveDatabase();
+    broadcastPortalChange('messages', (client) => canReceiveMessageChange(client, messageRecord));
+    return sendJson(response, 201, { ok: true });
+  }
+
+  if (request.method === 'GET' && pathname === '/api/admin/summary') {
+    const admin = requireAdmin(request, response);
+    if (!admin) return;
+    return sendJson(response, 200, {
+      users: database.users.map(userSummary),
+      documentCount: database.documents.length,
+      messageCount: database.messages.length
+    });
+  }
+
+  if (request.method === 'POST' && pathname === '/api/admin/users') {
+    const admin = requireAdmin(request, response);
+    if (!admin) return;
+    const body = await readJson(request);
+    const name = cleanText(body.name, 80);
+    const email = normalizeEmail(body.email);
+    const password = String(body.password || '');
+    const role = body.role === 'admin' ? 'admin' : 'user';
+    if (name.length < 2) return sendError(response, 400, 'Enter a full name.');
+    if (!validEmail(email)) return sendError(response, 400, 'Enter a valid email address.');
+    if (password.length < 8) return sendError(response, 400, 'Use a password with at least 8 characters.');
+    if (database.users.some((user) => user.email === email)) {
+      return sendError(response, 409, 'An account with that email already exists.');
+    }
+    const user = {
+      id: crypto.randomUUID(),
+      email,
+      passwordHash: await hashPassword(password),
+      role,
+      investment: 0,
+      createdAt: new Date().toISOString(),
+      profile: { name, company: '', phone: '', location: '' }
+    };
+    database.users.push(user);
+    saveDatabase();
+    broadcastPortalChange('admin', (client) => client.role === 'admin');
+    return sendJson(response, 201, { user: userSummary(user) });
+  }
+
+  if (request.method === 'PATCH' && pathname === '/api/admin/project') {
+    const admin = requireAdmin(request, response);
+    if (!admin) return;
+    const body = await readJson(request);
+
+    // The "Save timeline" form on the admin page sends only { stages }.
+    // Handle that shape on its own — it must not require the project
+    // figures (value/cost/progress) that a different form on the same
+    // page is responsible for.
+    if (Array.isArray(body.stages)) {
+      const validStatuses = new Set(['complete', 'current', 'upcoming']);
+      const stages = body.stages
+        .map((stage) => ({
+          name: cleanText(stage?.name, 80),
+          status: validStatuses.has(stage?.status) ? stage.status : 'upcoming',
+          date: cleanText(stage?.date, 40)
+        }))
+        .filter((stage) => stage.name);
+      if (!stages.length) return sendError(response, 400, 'Add at least one milestone with a name.');
+      database.project.stages = stages;
+      saveDatabase();
+      broadcastPortalChange('project');
+      return sendJson(response, 200, { project: database.project });
+    }
+
+    // Otherwise this is the "Save project figures" form: value, cost and
+    // progress are required; status, location and capacity are optional.
+    const totalProjectValue = Number(body.totalProjectValue);
+    const estimatedProjectCost = Number(body.estimatedProjectCost);
+    const projectProgress = Number(body.projectProgress);
+    if (![totalProjectValue, estimatedProjectCost, projectProgress].every(Number.isFinite) || totalProjectValue < 0 || estimatedProjectCost < 0 || projectProgress < 0 || projectProgress > 100) {
+      return sendError(response, 400, 'Provide valid project value, cost and progress values.');
+    }
+    database.project.totalProjectValue = Math.round(totalProjectValue);
+    database.project.estimatedProjectCost = Math.round(estimatedProjectCost);
+    database.project.projectProgress = Math.round(projectProgress * 10) / 10;
+    if (body.status) database.project.status = cleanText(body.status, 80);
+    if (body.location) database.project.location = cleanText(body.location, 120);
+    if (body.capacity) database.project.capacity = cleanText(body.capacity, 120);
+    saveDatabase();
+    broadcastPortalChange('project');
+    return sendJson(response, 200, { project: database.project });
+  }
+
+  const investmentMatch = /^\/api\/admin\/users\/([a-zA-Z0-9-]+)\/investment$/.exec(pathname);
+  if (request.method === 'PATCH' && investmentMatch) {
+    const admin = requireAdmin(request, response);
+    if (!admin) return;
+    const body = await readJson(request);
+    const investment = Number(body.investment);
+    const user = database.users.find((candidate) => candidate.id === investmentMatch[1]);
+    if (!user || user.role === 'admin') return sendError(response, 404, 'Client account not found.');
+    if (!Number.isFinite(investment) || investment < 0) return sendError(response, 400, 'Investment must be a positive number.');
+    user.investment = Math.round(investment);
+    saveDatabase();
+    broadcastPortalChange('investment', (client) => client.userId === user.id || client.role === 'admin');
+    return sendJson(response, 200, { user: userSummary(user) });
+  }
+
+  if (request.method === 'POST' && pathname === '/api/admin/documents') {
+    const admin = requireAdmin(request, response);
+    if (!admin) return;
+    const buffer = await readRequestBody(request, MAX_UPLOAD_BYTES);
+    const { fields, files } = parseMultipart(buffer, request.headers['content-type']);
+    const file = files.file;
+    if (!file || !file.data.length) return sendError(response, 400, 'Choose a PDF to upload.');
+    const isPdf = file.contentType === 'application/pdf' && file.data.subarray(0, 5).toString('ascii') === '%PDF-';
+    if (!isPdf) return sendError(response, 400, 'Only valid PDF files can be uploaded.');
+    const audience = fields.audience === 'all' ? 'all' : String(fields.audience || '');
+    if (audience !== 'all' && !database.users.some((user) => user.id === audience && user.role === 'user')) {
+      return sendError(response, 400, 'Choose a valid recipient.');
+    }
+    const extension = '.pdf';
+    const storageName = `${crypto.randomUUID()}${extension}`;
+    await fsp.writeFile(path.join(UPLOAD_DIR, storageName), file.data);
+    const document = {
+      id: crypto.randomUUID(),
+      title: cleanText(fields.title, 140) || path.basename(file.filename || 'Project document.pdf', '.pdf'),
+      description: cleanText(fields.description, 300),
+      originalName: cleanText(path.basename(file.filename || 'Project document.pdf'), 140) || 'Project document.pdf',
+      audience,
+      storageName,
+      createdAt: new Date().toISOString(),
+      uploadedBy: admin.id
+    };
+    database.documents.unshift(document);
+    saveDatabase();
+    broadcastPortalChange('documents', (client) => canReceiveDocumentChange(client, document));
+    return sendJson(response, 201, { document: visibleDocument(document) });
+  }
+
+  if (request.method === 'GET' && pathname === '/api/admin/documents') {
+    const admin = requireAdmin(request, response);
+    if (!admin) return;
+    return sendJson(response, 200, { documents: database.documents.map(visibleDocument) });
+  }
+
+  const adminDocumentMatch = /^\/api\/admin\/documents\/([a-zA-Z0-9-]+)$/.exec(pathname);
+  if (request.method === 'DELETE' && adminDocumentMatch) {
+    const admin = requireAdmin(request, response);
+    if (!admin) return;
+    const index = database.documents.findIndex((item) => item.id === adminDocumentMatch[1]);
+    if (index === -1) return sendError(response, 404, 'Document not found.');
+    const [removed] = database.documents.splice(index, 1);
+    saveDatabase();
+    try {
+      await fsp.unlink(path.join(UPLOAD_DIR, removed.storageName));
+    } catch (error) {
+      if (error.code !== 'ENOENT') console.error('Failed to remove an uploaded file from disk.', error);
+    }
+    broadcastPortalChange('documents', (client) => canReceiveDocumentChange(client, removed));
+    return sendJson(response, 200, { ok: true });
+  }
+
+  return sendError(response, 404, 'This API endpoint was not found.');
+}
+
+const staticFiles = new Map([
+  ['/', { file: 'index.html', type: 'text/html; charset=utf-8' }],
+  ['/index.html', { file: 'index.html', type: 'text/html; charset=utf-8' }],
+  ['/styles.css', { file: 'styles.css', type: 'text/css; charset=utf-8' }],
+  ['/app.js', { file: 'app.js', type: 'text/javascript; charset=utf-8' }],
+  ['/dashboard.html', { file: 'index.html', type: 'text/html; charset=utf-8' }]
+]);
+
+async function serveStatic(response, pathname) {
+  const asset = staticFiles.get(pathname);
+  if (!asset) return sendError(response, 404, 'Page not found.');
+  try {
+    const content = await fsp.readFile(path.join(ROOT, asset.file));
+    response.writeHead(200, {
+      'Content-Type': asset.type,
+      'Cache-Control': asset.file === 'index.html' ? 'no-store' : 'public, max-age=3600',
+      'Content-Security-Policy': "default-src 'self'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'",
+      'X-Content-Type-Options': 'nosniff',
+      'X-Frame-Options': 'DENY',
+      'Referrer-Policy': 'same-origin'
+    });
+    response.end(content);
+  } catch {
+    sendError(response, 500, 'Unable to load application files.');
+  }
+}
+
+const server = http.createServer(async (request, response) => {
+  try {
+    const parsedUrl = new URL(request.url, `http://${request.headers.host || 'localhost'}`);
+    const pathname = decodeURIComponent(parsedUrl.pathname);
+    if (request.method === 'OPTIONS') {
+      response.writeHead(204, { Allow: 'GET, POST, PATCH, DELETE, OPTIONS' });
+      return response.end();
+    }
+    if (pathname.startsWith('/api/')) return handleApi(request, response, pathname);
+    return serveStatic(response, pathname);
+  } catch (error) {
+    const statusCode = error.statusCode || 500;
+    if (statusCode >= 500) console.error(error);
+    if (!response.headersSent) return sendError(response, statusCode, statusCode === 500 ? 'Something went wrong. Please try again.' : error.message);
+    response.end();
+  }
 });
 
-app.delete('/api/admin/documents/:id', requireAdmin, (req, res) => {
-  const index = db.documents.findIndex((d) => d.id === req.params.id);
-  if (index < 0) return res.status(404).json({ error: 'Document not found.' });
-  const [doc] = db.documents.splice(index, 1);
-  store.save();
-  removeFile(path.join(store.UPLOAD_DIR, doc.storedName));
-  res.json({ ok: true });
-});
-
-app.use('/api', (req, res) => res.status(404).json({ error: 'Not found.' }));
-
-/* ---------- static files: only the public frontend files are served ---------- */
-
-const send = (file) => (req, res) => res.sendFile(path.join(__dirname, file));
-app.get(['/', '/index.html'], send('index.html'));
-app.get('/styles.css', send('styles.css'));
-app.get('/app.js', send('app.js'));
-app.get('/favicon.ico', (req, res) => res.status(204).end()); // no more 500 on favicon requests
-
-const assetDir = path.join(__dirname, 'asset');
-if (fs.existsSync(assetDir)) app.use('/asset', express.static(assetDir, { index: false, dotfiles: 'ignore' }));
-
-app.use((req, res) => res.status(404).type('text').send('Not found'));
-
-app.use((error, req, res, next) => {
-  console.error(error);
-  if (res.headersSent) return next(error);
-  res.status(500).json({ error: 'Something went wrong on our side. Please try again.' });
-});
-
-app.listen(PORT, '0.0.0.0', () => console.log(`Portal listening on port ${PORT}`));
+initializeDatabase()
+  .then(() => server.listen(PORT, () => console.log(`Intercoastal Water portal is running at http://localhost:${PORT}`)))
+  .catch((error) => {
+    console.error('Unable to start the portal.', error);
+    process.exit(1);
+  });

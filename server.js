@@ -1,26 +1,30 @@
 'use strict';
 
+// Load variables from a local .env file (if present) before anything else
+// reads process.env — this must run before `require('./db')` below, since
+// db.js reads MONGODB_URI the moment it's required. On Render this line is
+// a harmless no-op: Render injects Environment-tab variables directly into
+// process.env, so there's no .env file there and nothing to load.
+require('dotenv').config();
+
 const http = require('node:http');
 const crypto = require('node:crypto');
+const path = require('node:path');
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
-const path = require('node:path');
 const { promisify } = require('node:util');
+const { ObjectId } = require('mongodb');
+const db = require('./db');
 
 const scrypt = promisify(crypto.scrypt);
 const PORT = Number(process.env.PORT || 3000);
 const ROOT = __dirname;
-const DATA_DIR = path.join(ROOT, 'data');
-const UPLOAD_DIR = path.join(ROOT, 'uploads');
-const DATABASE_FILE = path.join(DATA_DIR, 'database.json');
 const SESSION_TTL_MS = 1000 * 60 * 60 * 12;
 const MAX_JSON_BYTES = 1_000_000;
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
 const EVENT_HEARTBEAT_MS = 25_000;
 const sessions = new Map();
 const eventClients = new Set();
-
-let database;
 
 const defaultProject = {
   id: 'intercoastal-integrated-utility',
@@ -65,14 +69,6 @@ const defaultProject = {
   ]
 };
 
-function clone(value) {
-  return JSON.parse(JSON.stringify(value));
-}
-
-function defaultDatabase() {
-  return { users: [], project: clone(defaultProject), documents: [], messages: [] };
-}
-
 async function hashPassword(password) {
   const salt = crypto.randomBytes(16).toString('hex');
   const derived = await scrypt(password, salt, 64);
@@ -115,51 +111,6 @@ function publicUser(user) {
   };
 }
 
-async function initializeDatabase() {
-  await fsp.mkdir(DATA_DIR, { recursive: true });
-  await fsp.mkdir(UPLOAD_DIR, { recursive: true });
-
-  try {
-    database = JSON.parse(await fsp.readFile(DATABASE_FILE, 'utf8'));
-  } catch (error) {
-    if (error.code !== 'ENOENT') throw error;
-    database = defaultDatabase();
-  }
-
-  database.users ||= [];
-  database.documents ||= [];
-  database.messages ||= [];
-  database.project ||= clone(defaultProject);
-  database.project.stages ||= clone(defaultProject.stages);
-  database.project.updates ||= clone(defaultProject.updates);
-
-  const bootstrapEmail = normalizeEmail(process.env.ADMIN_EMAIL || 'admin@intercoastalwater.com');
-  if (!database.users.some((user) => user.email === bootstrapEmail)) {
-    const bootstrapPassword = process.env.ADMIN_PASSWORD || 'ChangeMe!2026';
-    database.users.push({
-      id: crypto.randomUUID(),
-      email: bootstrapEmail,
-      passwordHash: await hashPassword(bootstrapPassword),
-      role: 'admin',
-      investment: 0,
-      createdAt: new Date().toISOString(),
-      profile: {
-        name: cleanText(process.env.ADMIN_NAME || 'Intercoastal Administrator', 80),
-        company: 'Intercoastal Water LLC',
-        phone: '',
-        location: 'Coastal Service District'
-      }
-    });
-  }
-  saveDatabase();
-}
-
-function saveDatabase() {
-  const temporaryFile = `${DATABASE_FILE}.${process.pid}.tmp`;
-  fs.writeFileSync(temporaryFile, JSON.stringify(database, null, 2), 'utf8');
-  fs.renameSync(temporaryFile, DATABASE_FILE);
-}
-
 function sendJson(response, statusCode, payload, extraHeaders = {}) {
   response.writeHead(statusCode, {
     'Content-Type': 'application/json; charset=utf-8',
@@ -195,7 +146,7 @@ function sessionCookie(token, maxAge = Math.floor(SESSION_TTL_MS / 1000)) {
   return `intercoastal_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAge}${secure}`;
 }
 
-function getCurrentUser(request) {
+async function getCurrentUser(request) {
   const token = parseCookies(request.headers.cookie).intercoastal_session;
   const session = token && sessions.get(token);
   if (!session) return null;
@@ -203,12 +154,11 @@ function getCurrentUser(request) {
     sessions.delete(token);
     return null;
   }
-  const user = database.users.find((candidate) => candidate.id === session.userId);
-  return user || null;
+  return db.findUserById(session.userId);
 }
 
-function requireUser(request, response) {
-  const user = getCurrentUser(request);
+async function requireUser(request, response) {
+  const user = await getCurrentUser(request);
   if (!user) {
     sendError(response, 401, 'Please sign in to continue.');
     return null;
@@ -216,8 +166,8 @@ function requireUser(request, response) {
   return user;
 }
 
-function requireAdmin(request, response) {
-  const user = requireUser(request, response);
+async function requireAdmin(request, response) {
+  const user = await requireUser(request, response);
   if (!user) return null;
   if (user.role !== 'admin') {
     sendError(response, 403, 'Administrator access is required.');
@@ -295,8 +245,7 @@ function parseMultipart(buffer, contentType) {
   return { fields, files };
 }
 
-function overviewFor(user) {
-  const project = database.project;
+function overviewFor(user, project) {
   const yourInvestment = Number(user.investment || 0);
   return {
     yourInvestment,
@@ -375,8 +324,8 @@ function canReceiveMessageChange(client, message) {
     || message.recipientId === client.userId;
 }
 
-function openEventStream(request, response) {
-  const user = getCurrentUser(request);
+async function openEventStream(request, response) {
+  const user = await getCurrentUser(request);
   if (!user) {
     sendError(response, 401, 'Please sign in to continue.');
     return;
@@ -430,9 +379,7 @@ async function handleApi(request, response, pathname) {
     if (name.length < 2) return sendError(response, 400, 'Enter your full name.');
     if (!validEmail(email)) return sendError(response, 400, 'Enter a valid email address.');
     if (password.length < 8) return sendError(response, 400, 'Use a password with at least 8 characters.');
-    if (database.users.some((user) => user.email === email)) {
-      return sendError(response, 409, 'An account with that email already exists.');
-    }
+    if (await db.userCountByEmail(email)) return sendError(response, 409, 'An account with that email already exists.');
     const user = {
       id: crypto.randomUUID(),
       email,
@@ -442,8 +389,7 @@ async function handleApi(request, response, pathname) {
       createdAt: new Date().toISOString(),
       profile: { name, company: '', phone: '', location: '' }
     };
-    database.users.push(user);
-    saveDatabase();
+    await db.insertUser(user);
     broadcastPortalChange('admin', (client) => client.role === 'admin');
     const token = createSession(user.id);
     return sendJson(response, 201, { user: publicUser(user) }, { 'Set-Cookie': sessionCookie(token) });
@@ -453,7 +399,7 @@ async function handleApi(request, response, pathname) {
     const body = await readJson(request);
     const email = normalizeEmail(body.email);
     const password = String(body.password || '');
-    const user = database.users.find((candidate) => candidate.email === email);
+    const user = await db.findUserByEmail(email);
     if (!user || !(await passwordMatches(password, user.passwordHash))) {
       return sendError(response, 401, 'Invalid email or password.');
     }
@@ -468,7 +414,7 @@ async function handleApi(request, response, pathname) {
   }
 
   if (request.method === 'GET' && pathname === '/api/auth/me') {
-    const user = requireUser(request, response);
+    const user = await requireUser(request, response);
     if (!user) return;
     return sendJson(response, 200, { user: publicUser(user) });
   }
@@ -478,75 +424,73 @@ async function handleApi(request, response, pathname) {
   }
 
   if (request.method === 'GET' && pathname === '/api/dashboard') {
-    const user = requireUser(request, response);
+    const user = await requireUser(request, response);
     if (!user) return;
-    const documents = database.documents.filter((document) => canAccessDocument(document, user));
+    const project = await db.getProject(defaultProject);
+    const allDocs = await db.allDocuments();
+    const documents = allDocs.filter((document) => canAccessDocument(document, user));
+    const allMsgs = await db.messagesFor(user);
     return sendJson(response, 200, {
       user: publicUser(user),
-      project: database.project,
-      overview: overviewFor(user),
+      project,
+      overview: overviewFor(user, project),
       recentDocuments: documents.slice(0, 3).map(visibleDocument),
-      unreadMessages: database.messages.filter((message) => user.role === 'admin' || message.senderId === user.id).length
+      unreadMessages: allMsgs.filter((message) => user.role === 'admin' || message.senderId === user.id).length
     });
   }
 
   if (request.method === 'GET' && pathname === '/api/documents') {
-    const user = requireUser(request, response);
+    const user = await requireUser(request, response);
     if (!user) return;
+    const allDocs = await db.allDocuments();
     return sendJson(response, 200, {
-      documents: database.documents.filter((document) => canAccessDocument(document, user)).map(visibleDocument)
+      documents: allDocs.filter((document) => canAccessDocument(document, user)).map(visibleDocument)
     });
   }
 
   const documentMatch = /^\/api\/documents\/([a-zA-Z0-9-]+)\/download$/.exec(pathname);
   if (request.method === 'GET' && documentMatch) {
-    const user = requireUser(request, response);
+    const user = await requireUser(request, response);
     if (!user) return;
-    const document = database.documents.find((item) => item.id === documentMatch[1]);
+    const document = await db.findDocument(documentMatch[1]);
     if (!document || !canAccessDocument(document, user)) return sendError(response, 404, 'Document not found.');
-    const documentPath = path.join(UPLOAD_DIR, document.storageName);
-    try {
-      await fsp.access(documentPath);
-    } catch {
-      return sendError(response, 404, 'The uploaded file is no longer available.');
-    }
     response.writeHead(200, {
       'Content-Type': 'application/pdf',
       'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(document.originalName)}`,
       'Cache-Control': 'private, no-store',
       'X-Content-Type-Options': 'nosniff'
     });
-    return fs.createReadStream(documentPath).pipe(response);
+    const stream = db.downloadFileStream(new ObjectId(document.fileId));
+    stream.on('error', () => { if (!response.headersSent) sendError(response, 404, 'The uploaded file is no longer available.'); else response.end(); });
+    return stream.pipe(response);
   }
 
   if (request.method === 'PATCH' && pathname === '/api/profile') {
-    const user = requireUser(request, response);
+    const user = await requireUser(request, response);
     if (!user) return;
     const body = await readJson(request);
     const name = cleanText(body.name, 80);
     if (name.length < 2) return sendError(response, 400, 'Enter a name with at least 2 characters.');
-    user.profile = {
+    const profile = {
       name,
       company: cleanText(body.company, 100),
       phone: cleanText(body.phone, 40),
       location: cleanText(body.location, 100)
     };
-    saveDatabase();
+    const updated = await db.updateUser(user.id, { profile });
     broadcastPortalChange('profile', (client) => client.userId === user.id || client.role === 'admin');
-    return sendJson(response, 200, { user: publicUser(user) });
+    return sendJson(response, 200, { user: publicUser(updated) });
   }
 
   if (request.method === 'GET' && pathname === '/api/messages') {
-    const user = requireUser(request, response);
+    const user = await requireUser(request, response);
     if (!user) return;
-    const messages = user.role === 'admin'
-      ? database.messages
-      : database.messages.filter((message) => message.senderId === user.id || message.recipientId === user.id || message.recipientId === 'all');
-    return sendJson(response, 200, { messages: messages.slice(0, 50) });
+    const list = await db.messagesFor(user);
+    return sendJson(response, 200, { messages: list });
   }
 
   if (request.method === 'POST' && pathname === '/api/messages') {
-    const user = requireUser(request, response);
+    const user = await requireUser(request, response);
     if (!user) return;
     const body = await readJson(request);
     const subject = cleanText(body.subject, 120);
@@ -561,24 +505,20 @@ async function handleApi(request, response, pathname) {
       message,
       createdAt: new Date().toISOString()
     };
-    database.messages.unshift(messageRecord);
-    saveDatabase();
+    await db.insertMessage(messageRecord);
     broadcastPortalChange('messages', (client) => canReceiveMessageChange(client, messageRecord));
     return sendJson(response, 201, { ok: true });
   }
 
   if (request.method === 'GET' && pathname === '/api/admin/summary') {
-    const admin = requireAdmin(request, response);
+    const admin = await requireAdmin(request, response);
     if (!admin) return;
-    return sendJson(response, 200, {
-      users: database.users.map(userSummary),
-      documentCount: database.documents.length,
-      messageCount: database.messages.length
-    });
+    const [list, documentCount, messageCount] = await Promise.all([db.allUsers(), db.allDocuments().then((d) => d.length), db.countMessages()]);
+    return sendJson(response, 200, { users: list.map(userSummary), documentCount, messageCount });
   }
 
   if (request.method === 'POST' && pathname === '/api/admin/users') {
-    const admin = requireAdmin(request, response);
+    const admin = await requireAdmin(request, response);
     if (!admin) return;
     const body = await readJson(request);
     const name = cleanText(body.name, 80);
@@ -588,9 +528,7 @@ async function handleApi(request, response, pathname) {
     if (name.length < 2) return sendError(response, 400, 'Enter a full name.');
     if (!validEmail(email)) return sendError(response, 400, 'Enter a valid email address.');
     if (password.length < 8) return sendError(response, 400, 'Use a password with at least 8 characters.');
-    if (database.users.some((user) => user.email === email)) {
-      return sendError(response, 409, 'An account with that email already exists.');
-    }
+    if (await db.userCountByEmail(email)) return sendError(response, 409, 'An account with that email already exists.');
     const user = {
       id: crypto.randomUUID(),
       email,
@@ -600,21 +538,16 @@ async function handleApi(request, response, pathname) {
       createdAt: new Date().toISOString(),
       profile: { name, company: '', phone: '', location: '' }
     };
-    database.users.push(user);
-    saveDatabase();
+    await db.insertUser(user);
     broadcastPortalChange('admin', (client) => client.role === 'admin');
     return sendJson(response, 201, { user: userSummary(user) });
   }
 
   if (request.method === 'PATCH' && pathname === '/api/admin/project') {
-    const admin = requireAdmin(request, response);
+    const admin = await requireAdmin(request, response);
     if (!admin) return;
     const body = await readJson(request);
 
-    // The "Save timeline" form on the admin page sends only { stages }.
-    // Handle that shape on its own — it must not require the project
-    // figures (value/cost/progress) that a different form on the same
-    // page is responsible for.
     if (Array.isArray(body.stages)) {
       const validStatuses = new Set(['complete', 'current', 'upcoming']);
       const stages = body.stages
@@ -625,48 +558,46 @@ async function handleApi(request, response, pathname) {
         }))
         .filter((stage) => stage.name);
       if (!stages.length) return sendError(response, 400, 'Add at least one milestone with a name.');
-      database.project.stages = stages;
-      saveDatabase();
+      const project = await db.saveProject({ stages });
       broadcastPortalChange('project');
-      return sendJson(response, 200, { project: database.project });
+      return sendJson(response, 200, { project });
     }
 
-    // Otherwise this is the "Save project figures" form: value, cost and
-    // progress are required; status, location and capacity are optional.
     const totalProjectValue = Number(body.totalProjectValue);
     const estimatedProjectCost = Number(body.estimatedProjectCost);
     const projectProgress = Number(body.projectProgress);
     if (![totalProjectValue, estimatedProjectCost, projectProgress].every(Number.isFinite) || totalProjectValue < 0 || estimatedProjectCost < 0 || projectProgress < 0 || projectProgress > 100) {
       return sendError(response, 400, 'Provide valid project value, cost and progress values.');
     }
-    database.project.totalProjectValue = Math.round(totalProjectValue);
-    database.project.estimatedProjectCost = Math.round(estimatedProjectCost);
-    database.project.projectProgress = Math.round(projectProgress * 10) / 10;
-    if (body.status) database.project.status = cleanText(body.status, 80);
-    if (body.location) database.project.location = cleanText(body.location, 120);
-    if (body.capacity) database.project.capacity = cleanText(body.capacity, 120);
-    saveDatabase();
+    const update = {
+      totalProjectValue: Math.round(totalProjectValue),
+      estimatedProjectCost: Math.round(estimatedProjectCost),
+      projectProgress: Math.round(projectProgress * 10) / 10
+    };
+    if (body.status) update.status = cleanText(body.status, 80);
+    if (body.location) update.location = cleanText(body.location, 120);
+    if (body.capacity) update.capacity = cleanText(body.capacity, 120);
+    const project = await db.saveProject(update);
     broadcastPortalChange('project');
-    return sendJson(response, 200, { project: database.project });
+    return sendJson(response, 200, { project });
   }
 
   const investmentMatch = /^\/api\/admin\/users\/([a-zA-Z0-9-]+)\/investment$/.exec(pathname);
   if (request.method === 'PATCH' && investmentMatch) {
-    const admin = requireAdmin(request, response);
+    const admin = await requireAdmin(request, response);
     if (!admin) return;
     const body = await readJson(request);
     const investment = Number(body.investment);
-    const user = database.users.find((candidate) => candidate.id === investmentMatch[1]);
+    const user = await db.findUserById(investmentMatch[1]);
     if (!user || user.role === 'admin') return sendError(response, 404, 'Client account not found.');
     if (!Number.isFinite(investment) || investment < 0) return sendError(response, 400, 'Investment must be a positive number.');
-    user.investment = Math.round(investment);
-    saveDatabase();
+    const updated = await db.updateUser(user.id, { investment: Math.round(investment) });
     broadcastPortalChange('investment', (client) => client.userId === user.id || client.role === 'admin');
-    return sendJson(response, 200, { user: userSummary(user) });
+    return sendJson(response, 200, { user: userSummary(updated) });
   }
 
   if (request.method === 'POST' && pathname === '/api/admin/documents') {
-    const admin = requireAdmin(request, response);
+    const admin = await requireAdmin(request, response);
     if (!admin) return;
     const buffer = await readRequestBody(request, MAX_UPLOAD_BYTES);
     const { fields, files } = parseMultipart(buffer, request.headers['content-type']);
@@ -675,47 +606,41 @@ async function handleApi(request, response, pathname) {
     const isPdf = file.contentType === 'application/pdf' && file.data.subarray(0, 5).toString('ascii') === '%PDF-';
     if (!isPdf) return sendError(response, 400, 'Only valid PDF files can be uploaded.');
     const audience = fields.audience === 'all' ? 'all' : String(fields.audience || '');
-    if (audience !== 'all' && !database.users.some((user) => user.id === audience && user.role === 'user')) {
-      return sendError(response, 400, 'Choose a valid recipient.');
+    if (audience !== 'all') {
+      const recipient = await db.findUserById(audience);
+      if (!recipient || recipient.role !== 'user') return sendError(response, 400, 'Choose a valid recipient.');
     }
-    const extension = '.pdf';
-    const storageName = `${crypto.randomUUID()}${extension}`;
-    await fsp.writeFile(path.join(UPLOAD_DIR, storageName), file.data);
+    const originalName = cleanText(path.basename(file.filename || 'Project document.pdf'), 140) || 'Project document.pdf';
+    const fileId = await db.uploadFileToGridFS(file.data, originalName);
     const document = {
       id: crypto.randomUUID(),
-      title: cleanText(fields.title, 140) || path.basename(file.filename || 'Project document.pdf', '.pdf'),
+      title: cleanText(fields.title, 140) || path.basename(originalName, '.pdf'),
       description: cleanText(fields.description, 300),
-      originalName: cleanText(path.basename(file.filename || 'Project document.pdf'), 140) || 'Project document.pdf',
+      originalName,
       audience,
-      storageName,
+      fileId: fileId.toString(),
       createdAt: new Date().toISOString(),
       uploadedBy: admin.id
     };
-    database.documents.unshift(document);
-    saveDatabase();
+    await db.insertDocument(document);
     broadcastPortalChange('documents', (client) => canReceiveDocumentChange(client, document));
     return sendJson(response, 201, { document: visibleDocument(document) });
   }
 
   if (request.method === 'GET' && pathname === '/api/admin/documents') {
-    const admin = requireAdmin(request, response);
+    const admin = await requireAdmin(request, response);
     if (!admin) return;
-    return sendJson(response, 200, { documents: database.documents.map(visibleDocument) });
+    const list = await db.allDocuments();
+    return sendJson(response, 200, { documents: list.map(visibleDocument) });
   }
 
   const adminDocumentMatch = /^\/api\/admin\/documents\/([a-zA-Z0-9-]+)$/.exec(pathname);
   if (request.method === 'DELETE' && adminDocumentMatch) {
-    const admin = requireAdmin(request, response);
+    const admin = await requireAdmin(request, response);
     if (!admin) return;
-    const index = database.documents.findIndex((item) => item.id === adminDocumentMatch[1]);
-    if (index === -1) return sendError(response, 404, 'Document not found.');
-    const [removed] = database.documents.splice(index, 1);
-    saveDatabase();
-    try {
-      await fsp.unlink(path.join(UPLOAD_DIR, removed.storageName));
-    } catch (error) {
-      if (error.code !== 'ENOENT') console.error('Failed to remove an uploaded file from disk.', error);
-    }
+    const removed = await db.deleteDocument(adminDocumentMatch[1]);
+    if (!removed) return sendError(response, 404, 'Document not found.');
+    await db.deleteFileFromGridFS(new ObjectId(removed.fileId));
     broadcastPortalChange('documents', (client) => canReceiveDocumentChange(client, removed));
     return sendJson(response, 200, { ok: true });
   }
@@ -732,6 +657,10 @@ const staticFiles = new Map([
 ]);
 
 async function serveStatic(response, pathname) {
+  if (pathname === '/favicon.ico') {
+    response.writeHead(204);
+    return response.end();
+  }
   const asset = staticFiles.get(pathname);
   if (!asset) return sendError(response, 404, 'Page not found.');
   try {
@@ -758,8 +687,8 @@ const server = http.createServer(async (request, response) => {
       response.writeHead(204, { Allow: 'GET, POST, PATCH, DELETE, OPTIONS' });
       return response.end();
     }
-    if (pathname.startsWith('/api/')) return handleApi(request, response, pathname);
-    return serveStatic(response, pathname);
+    if (pathname.startsWith('/api/')) return await handleApi(request, response, pathname);
+    return await serveStatic(response, pathname);
   } catch (error) {
     const statusCode = error.statusCode || 500;
     if (statusCode >= 500) console.error(error);
@@ -768,7 +697,8 @@ const server = http.createServer(async (request, response) => {
   }
 });
 
-initializeDatabase()
+db.connect()
+  .then(() => db.seedAdmin({ hashPassword, cleanText }))
   .then(() => server.listen(PORT, () => console.log(`Intercoastal Water portal is running at http://localhost:${PORT}`)))
   .catch((error) => {
     console.error('Unable to start the portal.', error);

@@ -1,13 +1,17 @@
 {
-  "name": "intercoastal-water-portal",
+  "name": "intercoastal-portal",
   "version": "1.0.0",
   "private": true,
-  "description": "Intercoastal Water LLC client and administration portal.",
+  "description": "Intercoastal Water LLC client and administration portal (MongoDB-backed, vanilla http server)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
   "engines": {
     "node": ">=18"
   },
   "dependencies": {
-    "@vercel/blob": "^2.8.0",
-    "@vercel/kv": "latest"
+    "dotenv": "^16.6.1",
+    "mongodb": "^6.10.0"
   }
 }

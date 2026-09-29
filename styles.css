@@ -678,7 +678,7 @@ select {
 .dashboard-hero-note span { display: block; font-size: 11px; color: var(--text-on-ink-dim); margin-bottom: 8px; }
 .dashboard-hero-note strong { font-family: var(--font-display); font-size: 14px; line-height: 1.5; color: #fff; font-weight: 600; }
 
-.dashboard-stat-strip { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 14px; }
+.dashboard-stat-strip { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 14px; }
 .dashboard-stat-card {
   background: var(--surface);
   border: 1px solid var(--line);

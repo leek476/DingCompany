@@ -40,6 +40,7 @@ const defaultProject = {
   duration: '18 months',
   description: 'A resilient utility program that combines dependable power generation, treated water supply and modern sewage treatment for growing coastal communities.',
   capacity: '18 MW power · 9 MGD water · 6 MGD treatment',
+  investmentReturnRate: 0,
   stages: [
     { name: 'Site & permits', status: 'complete', date: 'Jun 2026' },
     { name: 'Detailed engineering', status: 'complete', date: 'Jul 2026' },
@@ -577,6 +578,33 @@ async function handleApi(request, response, pathname) {
     if (body.status) update.status = cleanText(body.status, 80);
     if (body.location) update.location = cleanText(body.location, 120);
     if (body.capacity) update.capacity = cleanText(body.capacity, 120);
+
+    // Admin-editable dates and the investment-return rate. Dates come from
+    // <input type="date"> as YYYY-MM-DD, which is exactly what dateLabel()
+    // and the input's own value attribute expect on the frontend, so they
+    // are stored as-is rather than reformatted.
+    if (body.startDate !== undefined) {
+      const startDate = cleanText(body.startDate, 20);
+      if (startDate && !/^\d{4}-\d{2}-\d{2}$/.test(startDate)) {
+        return sendError(response, 400, 'Start date must be a valid date.');
+      }
+      update.startDate = startDate;
+    }
+    if (body.projectedCompletion !== undefined) {
+      const projectedCompletion = cleanText(body.projectedCompletion, 20);
+      if (projectedCompletion && !/^\d{4}-\d{2}-\d{2}$/.test(projectedCompletion)) {
+        return sendError(response, 400, 'Target completion must be a valid date.');
+      }
+      update.projectedCompletion = projectedCompletion;
+    }
+    if (body.investmentReturnRate !== undefined && body.investmentReturnRate !== '') {
+      const investmentReturnRate = Number(body.investmentReturnRate);
+      if (!Number.isFinite(investmentReturnRate) || investmentReturnRate < 0 || investmentReturnRate > 1000) {
+        return sendError(response, 400, 'Investment return rate must be a number between 0 and 1000.');
+      }
+      update.investmentReturnRate = investmentReturnRate;
+    }
+
     const project = await db.saveProject(update);
     broadcastPortalChange('project');
     return sendJson(response, 200, { project });

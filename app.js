@@ -98,6 +98,14 @@
       : new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', year: 'numeric' }).format(date);
   }
 
+  /* <input type="date"> requires an exact YYYY-MM-DD value. dateLabel()
+     above is for display only, so this keeps the raw value usable as a
+     form field even if it's missing or in some other format. */
+  function dateInputValue(value) {
+    const raw = String(value || '');
+    return /^\d{4}-\d{2}-\d{2}$/.test(raw) ? raw : '';
+  }
+
   function initials(name) {
     return String(name || '?').trim().split(/\s+/).filter(Boolean).slice(0, 2)
       .map((part) => part[0]).join('').toUpperCase() || '?';
@@ -552,6 +560,12 @@
       || [...stages].reverse().find((stage) => stage.status === 'complete');
     const visibleUpdates = (project.updates || []).slice(0, 3);
 
+    // Investment return: an admin-set annual rate (%) applied to the
+    // client's own investment. Purely illustrative, same disclaimer style
+    // as the existing "illustrative proportional margin" figure.
+    const returnRate = toNumber(project.investmentReturnRate);
+    const returnAmount = investment * (returnRate / 100);
+
     const stageNodes = stages.map((stage, index) => {
       const stageState = stage.status === 'complete' ? 'done' : stage.status === 'current' ? 'current' : 'upcoming';
       const label = stageState === 'done' ? 'Complete' : stageState === 'current' ? 'In progress' : 'Upcoming';
@@ -615,6 +629,11 @@
           <div class="dashboard-stat-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 9h18M8 3v4M16 3v4"/></svg></div>
           <span>Current phase</span><strong class="dashboard-stage-value">${escapeHtml(activeStage?.name || project.status || 'Active')}</strong>
           <small>${escapeHtml(project.duration || 'Delivery programme')}</small>
+        </article>
+        <article class="dashboard-stat-card">
+          <div class="dashboard-stat-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 17l6-6 4 4 8-8"/><path d="M15 7h6v6"/></svg></div>
+          <span>Investment return</span><strong>${percent(returnRate)}</strong>
+          <small>${money(returnAmount)} projected on your investment</small>
         </article>
       </section>
 
@@ -719,6 +738,8 @@
     const investment = toNumber(overview.yourInvestment);
     const margin = toNumber(overview.expectedProjectMargin);
     const marginShare = investment * Math.max(0, ratio(margin, value));
+    const returnRate = toNumber(project.investmentReturnRate);
+    const returnAmount = investment * (returnRate / 100);
 
     return `${pageHeading('My investment', 'Your contribution and the project metrics it supports.', '<button class="button button-secondary" type="button" data-go="documents">View agreements</button>')}
       <section class="detail-hero panel">
@@ -733,6 +754,7 @@
           <div class="stat-row"><span>Programme value</span><strong>${money(value)}</strong></div>
           <div class="stat-row"><span>Current delivery</span><strong>${percent(project.projectProgress)}</strong></div>
           <div class="stat-row"><span>Project margin</span><strong>${money(margin)}</strong></div>
+          <div class="stat-row"><span>Investment return</span><strong class="positive">${percent(returnRate)}</strong></div>
         </div>
       </section>
 
@@ -750,6 +772,7 @@
           <div class="financial-list">
             <div class="financial-row"><span>Current contribution</span><strong>${money(investment)}</strong><em>Maintained by your project administrator.</em></div>
             <div class="financial-row"><span>Share of total value</span><strong>${percent(overview.investmentShare)}</strong><em>Calculated against current project value.</em></div>
+            <div class="financial-row"><span>Investment return rate</span><strong>${percent(returnRate)}</strong><em>Set by your project administrator.</em></div>
             <div class="financial-row highlight"><span>Illustrative proportional margin</span><strong>${money(marginShare)}</strong><em>Not a promise of return. Subject to executed agreements and project performance.</em></div>
           </div>
         </article>
@@ -805,6 +828,7 @@
             <div class="stat-row"><span>Water service</span><strong>Treated water supply</strong></div>
             <div class="stat-row"><span>Treatment service</span><strong>Sewage treatment</strong></div>
             <div class="stat-row"><span>Duration</span><strong>${escapeHtml(project.duration || '—')}</strong></div>
+            <div class="stat-row"><span>Start date</span><strong>${escapeHtml(dateLabel(project.startDate))}</strong></div>
             <div class="stat-row"><span>Target completion</span><strong>${escapeHtml(dateLabel(project.projectedCompletion))}</strong></div>
           </div>
         </article>
@@ -969,7 +993,7 @@
 
       <div class="stack">
         <article class="panel">
-          <div class="panel-head"><div><h2>Project figures</h2><p>These four numbers drive the cards at the top of every client dashboard.</p></div></div>
+          <div class="panel-head"><div><h2>Project figures</h2><p>These figures drive the cards at the top of every client dashboard.</p></div></div>
           <form id="project-admin-form" class="form-grid">
             <label class="field">Total project value (USD)
               <input type="number" name="totalProjectValue" min="0" step="1000" inputmode="numeric" value="${escapeHtml(toNumber(project.totalProjectValue))}" required>
@@ -982,6 +1006,18 @@
             <label class="field">Project progress (%)
               <input type="number" name="projectProgress" min="0" max="100" step="0.1" inputmode="decimal" value="${escapeHtml(toNumber(project.projectProgress))}" required>
               <span class="form-note">Drives the progress card, the donut and the timeline bar.</span>
+            </label>
+            <label class="field">Investment return rate (%)
+              <input type="number" name="investmentReturnRate" min="0" max="1000" step="0.1" inputmode="decimal" value="${escapeHtml(toNumber(project.investmentReturnRate))}">
+              <span class="form-note">Illustrative annual return applied to each client's own investment figure.</span>
+            </label>
+            <label class="field">Start date
+              <input type="date" name="startDate" value="${escapeHtml(dateInputValue(project.startDate))}">
+              <span class="form-note">Shown as ${escapeHtml(dateLabel(project.startDate))} on client dashboards.</span>
+            </label>
+            <label class="field">Target completion
+              <input type="date" name="projectedCompletion" value="${escapeHtml(dateInputValue(project.projectedCompletion))}">
+              <span class="form-note">Shown as ${escapeHtml(dateLabel(project.projectedCompletion))} on client dashboards.</span>
             </label>
             <label class="field">Project status
               <input name="status" maxlength="80" value="${escapeHtml(project.status || '')}" required>
@@ -1124,6 +1160,25 @@
   function renderStageRows() {
     const container = content.querySelector('#stage-rows');
     if (container) container.innerHTML = stageRows();
+  }
+
+  /* Updates each row's status <select> to match state.stageDraft WITHOUT
+     rebuilding any DOM nodes. This is the fix for the "timeline isn't
+     selecting properly" bug: the previous code called renderStageRows()
+     (a full innerHTML rebuild, destroying and recreating every <select>)
+     on every status change, including the one the user had just clicked.
+     Replacing an element while its native dropdown is still closing is
+     unreliable across browsers and made the selection feel like it
+     "didn't take" or required a second click. Setting .value directly on
+     the existing elements avoids touching the DOM node at all. */
+  function syncStageRowStatuses() {
+    const stages = state.stageDraft || [];
+    content.querySelectorAll('.stage-row').forEach((row) => {
+      const index = Number(row.dataset.stageIndex);
+      const stage = stages[index];
+      const select = row.querySelector('select[name="stageStatus"]');
+      if (stage && select && select.value !== stage.status) select.value = stage.status;
+    });
   }
 
   /* Exactly one milestone can be in progress: it is what the dashboard shows
@@ -1361,7 +1416,11 @@
     const stageRow = event.target.closest('.stage-row');
     if (stageRow && event.target.name === 'stageStatus' && state.stageDraft) {
       const index = Number(stageRow.dataset.stageIndex);
-      if (setStageStatus(index, event.target.value)) renderStageRows();
+      // Update state, then sync only the affected <select> values in
+      // place — no innerHTML rebuild, so nothing gets yanked out from
+      // under the dropdown the user is actively interacting with.
+      setStageStatus(index, event.target.value);
+      syncStageRowStatuses();
       return;
     }
     if (event.target.name === 'userId' && event.target.closest('#investment-admin-form')) {

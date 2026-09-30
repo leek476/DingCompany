@@ -1162,38 +1162,15 @@
     if (container) container.innerHTML = stageRows();
   }
 
-  /* Updates each row's status <select> to match state.stageDraft WITHOUT
-     rebuilding any DOM nodes. This is the fix for the "timeline isn't
-     selecting properly" bug: the previous code called renderStageRows()
-     (a full innerHTML rebuild, destroying and recreating every <select>)
-     on every status change, including the one the user had just clicked.
-     Replacing an element while its native dropdown is still closing is
-     unreliable across browsers and made the selection feel like it
-     "didn't take" or required a second click. Setting .value directly on
-     the existing elements avoids touching the DOM node at all. */
-  function syncStageRowStatuses() {
-    const stages = state.stageDraft || [];
-    content.querySelectorAll('.stage-row').forEach((row) => {
-      const index = Number(row.dataset.stageIndex);
-      const stage = stages[index];
-      const select = row.querySelector('select[name="stageStatus"]');
-      if (stage && select && select.value !== stage.status) select.value = stage.status;
-    });
-  }
-
-  /* Exactly one milestone can be in progress: it is what the dashboard shows
-     as the current phase. Setting a new one demotes the old. */
+  /* Each milestone's status is fully independent — the admin can set any
+     row to any of the three statuses, including having several rows
+     marked "In progress" at once. (An earlier version auto-demoted other
+     "In progress" rows to keep just one; that restriction is gone.) The
+     dashboard's "current phase" card picks the first row marked "In
+     progress" if there are several. */
   function setStageStatus(index, status) {
     const stages = state.stageDraft || [];
-    stages[index].status = status;
-    if (status !== 'current') return false;
-    let changedOthers = false;
-    stages.forEach((stage, position) => {
-      if (position === index || stage.status !== 'current') return;
-      stage.status = position < index ? 'complete' : 'upcoming';
-      changedOthers = true;
-    });
-    return changedOthers;
+    if (stages[index]) stages[index].status = status;
   }
 
   async function submitTimelineAdmin(form) {
@@ -1416,11 +1393,10 @@
     const stageRow = event.target.closest('.stage-row');
     if (stageRow && event.target.name === 'stageStatus' && state.stageDraft) {
       const index = Number(stageRow.dataset.stageIndex);
-      // Update state, then sync only the affected <select> values in
-      // place — no innerHTML rebuild, so nothing gets yanked out from
-      // under the dropdown the user is actively interacting with.
+      // Just record the choice in state — nothing else needs to change,
+      // so no re-render happens and the <select> the admin just used is
+      // never touched or replaced.
       setStageStatus(index, event.target.value);
-      syncStageRowStatuses();
       return;
     }
     if (event.target.name === 'userId' && event.target.closest('#investment-admin-form')) {

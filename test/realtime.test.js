@@ -264,10 +264,14 @@ test('authenticates SSE clients and scopes project and investment changes', { ti
       totalProjectValue: project.totalProjectValue + 1_000,
       estimatedProjectCost: project.estimatedProjectCost,
       projectProgress: project.projectProgress,
-      status: project.status
+      status: project.status,
+      capitalDeployed: 350000,
+      remainingCapital: 150000
     }
   });
   assert.equal(projectUpdate.response.status, 200);
+  assert.equal(projectUpdate.body.project.capitalDeployed, 350000);
+  assert.equal(projectUpdate.body.project.remainingCapital, 150000);
 
   const projectEvents = await Promise.all([
     withTimeout(nextPortalChange(adminStream), EVENT_TIMEOUT_MS, 'Admin did not receive the project event.'),

@@ -551,8 +551,12 @@
     const progress = clamp(project.projectProgress);
     const costPercent = clamp(ratio(cost, value) * 100);
     const investment = toNumber(overview.yourInvestment);
-    const deployed = investment * (progress / 100);
-    const remaining = Math.max(0, investment - deployed);
+    const deployed = Object.prototype.hasOwnProperty.call(project, 'capitalDeployed')
+      ? toNumber(project.capitalDeployed)
+      : investment * (progress / 100);
+    const remaining = Object.prototype.hasOwnProperty.call(project, 'remainingCapital')
+      ? toNumber(project.remainingCapital)
+      : Math.max(0, investment - deployed);
     const marginShare = investment * ratio(margin, value);
     const donutCircumference = 314;
     const stages = project.stages || [];
@@ -1006,6 +1010,14 @@
             <label class="field">Project progress (%)
               <input type="number" name="projectProgress" min="0" max="100" step="0.1" inputmode="decimal" value="${escapeHtml(toNumber(project.projectProgress))}" required>
               <span class="form-note">Drives the progress card, the donut and the timeline bar.</span>
+            </label>
+            <label class="field">Capital deployed (USD)
+              <input type="number" name="capitalDeployed" min="0" step="1000" inputmode="numeric" value="${escapeHtml(toNumber(project.capitalDeployed))}">
+              <span class="form-note">Overrides the dashboard’s deployed-capital figure for this project.</span>
+            </label>
+            <label class="field">Remaining capital (USD)
+              <input type="number" name="remainingCapital" min="0" step="1000" inputmode="numeric" value="${escapeHtml(toNumber(project.remainingCapital))}">
+              <span class="form-note">Overrides the dashboard’s remaining-capital figure for this project.</span>
             </label>
             <label class="field">Investment return rate (%)
               <input type="number" name="investmentReturnRate" min="0" max="1000" step="0.1" inputmode="decimal" value="${escapeHtml(toNumber(project.investmentReturnRate))}">

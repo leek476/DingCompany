@@ -34,6 +34,8 @@ const defaultProject = {
   totalProjectValue: 12800000,
   estimatedProjectCost: 8420000,
   projectProgress: 68,
+  capitalDeployed: 0,
+  remainingCapital: 0,
   status: 'Construction in progress',
   startDate: '2026-06-15',
   projectedCompletion: '2026-12-20',
@@ -575,6 +577,20 @@ async function handleApi(request, response, pathname) {
       estimatedProjectCost: Math.round(estimatedProjectCost),
       projectProgress: Math.round(projectProgress * 10) / 10
     };
+    if (body.capitalDeployed !== undefined && body.capitalDeployed !== '') {
+      const capitalDeployed = Number(body.capitalDeployed);
+      if (!Number.isFinite(capitalDeployed) || capitalDeployed < 0) {
+        return sendError(response, 400, 'Capital deployed must be a valid non-negative number.');
+      }
+      update.capitalDeployed = Math.round(capitalDeployed);
+    }
+    if (body.remainingCapital !== undefined && body.remainingCapital !== '') {
+      const remainingCapital = Number(body.remainingCapital);
+      if (!Number.isFinite(remainingCapital) || remainingCapital < 0) {
+        return sendError(response, 400, 'Remaining capital must be a valid non-negative number.');
+      }
+      update.remainingCapital = Math.round(remainingCapital);
+    }
     if (body.status) update.status = cleanText(body.status, 80);
     if (body.location) update.location = cleanText(body.location, 120);
     if (body.capacity) update.capacity = cleanText(body.capacity, 120);

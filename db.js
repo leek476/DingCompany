@@ -110,6 +110,17 @@ async function userCountByEmail(email) {
   return users.countDocuments({ email });
 }
 
+// Permanently removes one user record. server.js decides who is allowed
+// to call this (admins only) and enforces the safeguards.
+async function deleteUser(id) {
+  await users.deleteOne({ id });
+}
+
+// Used to make sure the last remaining administrator can never be deleted.
+async function countAdmins() {
+  return users.countDocuments({ role: 'admin' });
+}
+
 /* ---------- documents (metadata) + GridFS (file bytes) ---------- */
 
 async function insertDocument(doc) {
@@ -132,6 +143,15 @@ async function deleteDocument(id) {
   if (!doc) return null;
   await documents.deleteOne({ id });
   return stripMongoId(doc);
+}
+
+// Removes every document addressed only to one user and returns them, so
+// server.js can also delete the stored PDF files from GridFS. Documents
+// shared with "all" are never touched.
+async function deleteDocumentsForAudience(userId) {
+  const found = await documents.find({ audience: userId }).toArray();
+  if (found.length) await documents.deleteMany({ audience: userId });
+  return found.map(stripMongoId);
 }
 
 function uploadFileToGridFS(buffer, filename) {
@@ -212,10 +232,13 @@ module.exports = {
   insertUser,
   updateUser,
   userCountByEmail,
+  deleteUser,
+  countAdmins,
   insertDocument,
   findDocument,
   allDocuments,
   deleteDocument,
+  deleteDocumentsForAudience,
   uploadFileToGridFS,
   downloadFileStream,
   deleteFileFromGridFS,

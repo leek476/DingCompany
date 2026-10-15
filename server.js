@@ -546,6 +546,51 @@ async function handleApi(request, response, pathname) {
     return sendJson(response, 201, { user: userSummary(user) });
   }
 
+  // Admin-only: permanently delete a user profile.
+  // Safeguards: you can't delete yourself, and you can't delete the last
+  // remaining administrator. Documents shared only with the deleted user
+  // are removed too (including the stored PDF data). Their messages are
+  // kept so the admin inbox history stays intact.
+  const adminUserMatch = /^\/api\/admin\/users\/([a-zA-Z0-9-]+)$/.exec(pathname);
+  if (request.method === 'DELETE' && adminUserMatch) {
+    const admin = await requireAdmin(request, response);
+    if (!admin) return;
+    const targetId = adminUserMatch[1];
+
+    if (targetId === admin.id) {
+      return sendError(response, 400, 'You cannot delete your own account.');
+    }
+
+    const target = await db.findUserById(targetId);
+    if (!target) return sendError(response, 404, 'That account no longer exists.');
+
+    if (target.role === 'admin' && (await db.countAdmins()) <= 1) {
+      return sendError(response, 400, 'You cannot delete the last administrator.');
+    }
+
+    const privateDocs = await db.deleteDocumentsForAudience(targetId);
+    await Promise.all(
+      privateDocs.map((doc) => db.deleteFileFromGridFS(new ObjectId(doc.fileId)).catch(() => {}))
+    );
+
+    await db.deleteUser(targetId);
+
+    // Sign them out everywhere and close any live connection they have open.
+    for (const [token, session] of sessions) {
+      if (session.userId === targetId) sessions.delete(token);
+    }
+    for (const client of [...eventClients]) {
+      if (client.userId === targetId) {
+        removeEventClient(client);
+        client.response.end();
+      }
+    }
+
+    broadcastPortalChange('admin', (client) => client.role === 'admin');
+    if (privateDocs.length) broadcastPortalChange('documents', (client) => client.role === 'admin');
+    return sendJson(response, 200, { ok: true });
+  }
+
   if (request.method === 'PATCH' && pathname === '/api/admin/project') {
     const admin = await requireAdmin(request, response);
     if (!admin) return;
@@ -740,6 +785,14 @@ const server = http.createServer(async (request, response) => {
     response.end();
   }
 });
+
+// The delete-user route needs these three helpers in db.js. If they are
+// missing, say so at startup instead of failing with a vague 500 later.
+for (const name of ['deleteUser', 'countAdmins', 'deleteDocumentsForAudience']) {
+  if (typeof db[name] !== 'function') {
+    console.warn(`db.${name}() is missing — add it to db.js (see db-additions.js) or deleting users will fail.`);
+  }
+}
 
 db.connect()
   .then(() => db.seedAdmin({ hashPassword, cleanText }))

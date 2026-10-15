@@ -526,6 +526,33 @@
     }).join('')}</div>`;
   }
 
+  /* NEW: admin-only list of every account, with a delete control on each row
+     except the signed-in admin's own (the server also refuses that). Reuses
+     the document-row layout and the existing avatar / pill / delete styles,
+     so no CSS changes are needed. */
+  function userRows(users) {
+    if (!users?.length) {
+      return '<div class="empty-state"><div><strong>No accounts yet</strong><p>Accounts you create appear here.</p></div></div>';
+    }
+    return `<div class="doc-list">${users.map((user) => {
+      const label = user.name || user.email || 'Unnamed account';
+      const isSelf = (user.id && user.id === state.me?.id) || (user.email && user.email === state.me?.email);
+      return `
+      <div class="document-row">
+        <span class="avatar" aria-hidden="true">${escapeHtml(initials(label))}</span>
+        <div class="doc-copy">
+          <strong title="${escapeHtml(label)}">${escapeHtml(label)}</strong>
+          <span>${escapeHtml(user.email || '')} · ${user.role === 'admin' ? 'Administrator' : 'Client partner'}</span>
+        </div>
+        <div class="doc-actions">
+          ${isSelf
+            ? '<span class="pill gray">You</span>'
+            : `<button class="icon-button delete-doc-button" type="button" data-delete-user="${escapeHtml(user.id)}" data-user-name="${escapeHtml(label)}" aria-label="Delete ${escapeHtml(label)}">&times;</button>`}
+        </div>
+      </div>`;
+    }).join('')}</div>`;
+  }
+
   function updateRows(updates) {
     if (!updates?.length) {
       return '<div class="empty-state"><div><strong>No updates yet</strong><p>Project leadership publishes verified field updates here.</p></div></div>';
@@ -1076,6 +1103,14 @@
         </article>
 
         <article class="panel">
+          <div class="panel-head">
+            <div><h2>Manage accounts</h2><p>Deleting a profile permanently removes that person's login and investment record. Only administrators can do this.</p></div>
+            <span class="pill gray">${pluralise((admin.users || []).length, 'account')}</span>
+          </div>
+          ${userRows(admin.users || [])}
+        </article>
+
+        <article class="panel">
           <div class="panel-head"><div><h2>Clients</h2><p>Set what one client has invested, and send them a PDF.</p></div></div>
           ${clients.length ? `
             <form id="investment-admin-form" class="form-stack">
@@ -1300,6 +1335,25 @@
     }
   }
 
+  /* NEW: delete a user profile. The button only appears for admins, but the
+     real protection is the server route, which must check the admin role. */
+  async function deleteAdminUser(id, name, button) {
+    if (state.me?.role !== 'admin') return;
+    if (!window.confirm(`Delete ${name}'s profile? Their login and investment record are removed permanently. This cannot be undone.`)) return;
+    setButtonBusy(button, true, '…');
+    try {
+      await api(`/api/admin/users/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      state.admin = await api('/api/admin/summary');
+      await loadAdminDocuments();
+      renderCurrentPage();
+      showToast('Profile deleted.');
+    } catch (error) {
+      handleFormError(error);
+    } finally {
+      setButtonBusy(button, false);
+    }
+  }
+
   async function submitNewUser(form) {
     const button = form.querySelector('button[type="submit"]');
     setButtonBusy(button, true, 'Creating…');
@@ -1359,6 +1413,17 @@
         deleteDocButton.dataset.deleteDocument,
         deleteDocButton.dataset.documentTitle || 'this document',
         deleteDocButton
+      );
+      return;
+    }
+
+    // NEW: delete-user button
+    const deleteUserButton = event.target.closest('[data-delete-user]');
+    if (deleteUserButton) {
+      await deleteAdminUser(
+        deleteUserButton.dataset.deleteUser,
+        deleteUserButton.dataset.userName || 'this user',
+        deleteUserButton
       );
       return;
     }
